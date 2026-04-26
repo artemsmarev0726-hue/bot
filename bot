@@ -21,8 +21,8 @@ log = logging.getLogger("ticket_bot")
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 EMBED_COLOR = 0x2482ED
-# Отдельный префикс от старого бота, чтобы не пересекаться с уже выложенными панелями.
-PANEL_BUTTON_CUSTOM_ID = "qrust_bothost:open_categories"
+# Постоянный custom_id выпадающего списка на панели (после перезапуска бота взаимодействия работают).
+PANEL_CATEGORY_SELECT_ID = "qrust_bothost:panel_category"
 
 
 def load_config_raw() -> dict[str, Any]:
@@ -186,7 +186,7 @@ class CategorySelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=opts,
-            custom_id="qrust_bothost:category_select_ephemeral",
+            custom_id=PANEL_CATEGORY_SELECT_ID,
         )
         self.cfg = cfg
         self.by_id = {str(t["id"]): t for t in options_meta}
@@ -210,31 +210,12 @@ class CategorySelect(discord.ui.Select):
         await interaction.response.send_modal(TicketModal(self.cfg, ticket_type))
 
 
-class CategoryPickView(discord.ui.View):
-    def __init__(self, cfg: dict[str, Any]):
-        super().__init__(timeout=300)
-        self.add_item(CategorySelect(cfg, cfg["ticket_types"]))
-
-
 class TicketPanelView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    """Панель: эмбед + выпадающий список типов тикетов (сразу под сообщением)."""
 
-    @discord.ui.button(
-        label="Выберите категорию",
-        style=discord.ButtonStyle.primary,
-        custom_id=PANEL_BUTTON_CUSTOM_ID,
-    )
-    async def open_categories(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        cfg = interaction.client.config  # type: ignore[attr-defined]
-        view = CategoryPickView(cfg)
-        await interaction.response.send_message(
-            "Выберите категорию тикета в меню ниже.",
-            view=view,
-            ephemeral=True,
-        )
+    def __init__(self, cfg: dict[str, Any]):
+        super().__init__(timeout=None)
+        self.add_item(CategorySelect(cfg, cfg["ticket_types"]))
 
 
 class TicketBot(commands.Bot):
@@ -244,7 +225,7 @@ class TicketBot(commands.Bot):
         self.config = config
 
     async def setup_hook(self) -> None:
-        self.add_view(TicketPanelView())
+        self.add_view(TicketPanelView(self.config))
         guild_id = int(self.config["guild_id"])
         guild = discord.Object(id=guild_id)
         self.tree.copy_global_to(guild=guild)
@@ -258,8 +239,7 @@ def build_panel_embed(cfg: dict[str, Any]) -> discord.Embed:
         color=EMBED_COLOR,
     )
     embed.description = (
-        "> Если вам нужна помощь, нажмите на кнопку, соответствующую типу тикета, "
-        "который вы хотите открыть."
+        "> Если вам нужна помощь, выберите тип тикета в списке ниже и заполните форму."
     )
     url = cfg.get("embed_image_url") or ""
     if isinstance(url, str) and url.strip():
@@ -288,7 +268,7 @@ def main() -> None:
             await interaction.response.send_message("Укажите текстовый канал.", ephemeral=True)
             return
         embed = build_panel_embed(bot.config)
-        await ch.send(embed=embed, view=TicketPanelView())
+        await ch.send(embed=embed, view=TicketPanelView(bot.config))
         await interaction.response.send_message(f"Панель отправлена в {ch.mention}.", ephemeral=True)
 
     @bot.event
