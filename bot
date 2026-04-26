@@ -172,7 +172,7 @@ class CategorySelect(discord.ui.Select):
             for t in options_meta[:25]
         ]
         super().__init__(
-            placeholder="Выберите тип тикета",
+            placeholder="Выберите категорию",
             min_values=1,
             max_values=1,
             options=opts,
@@ -311,7 +311,7 @@ def build_panel_embed(cfg: dict[str, Any]) -> discord.Embed:
         color=EMBED_COLOR,
     )
     embed.description = (
-        "> Если вам нужна помощь, выберите тип тикета в списке ниже и заполните форму."
+        "> Если вам нужна помощь, хотите встать на должность и тд. Выберите категорию тикета и заполните форму!"
     )
     url = cfg.get("embed_image_url") or ""
     if isinstance(url, str) and url.strip():
