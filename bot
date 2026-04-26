@@ -1,0 +1,348 @@
+"""
+Discord-бот тикетов QUICK RUST (discord.py).
+Скопируйте config.example.json в config.json и заполните значения.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("ticket_bot")
+
+CONFIG_PATH = Path(__file__).with_name("config.json")
+EMBED_COLOR = 0x2482ED
+PANEL_BUTTON_CUSTOM_ID = "quickrust:open_categories"
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.is_file():
+        raise FileNotFoundError(
+            f"Нет файла {CONFIG_PATH}. Скопируйте config.example.json в config.json."
+        )
+    with CONFIG_PATH.open(encoding="utf-8") as f:
+        return json.load(f)
+
+
+def safe_channel_name(s: str, max_len: int = 90) -> str:
+    s = s.lower().replace(" ", "-")
+    s = re.sub(r"[^a-z0-9\-_]", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"-+", "-", s).strip("-") or "ticket"
+    return s[:max_len]
+
+
+class TicketModal(discord.ui.Modal):
+    """Модальное окно с полями из config (не больше 5 полей на тип — лимит Discord)."""
+
+    def __init__(self, cfg: dict[str, Any], ticket_type: dict[str, Any]):
+        super().__init__(title=str(ticket_type["modal_title"])[:45])
+        self.cfg = cfg
+        self.ticket_type = ticket_type
+        for field in ticket_type["fields"][:5]:
+            style = (
+                discord.TextStyle.paragraph
+                if field.get("style") == "paragraph"
+                else discord.TextStyle.short
+            )
+            max_len = int(field.get("max_length", 400))
+            if style == discord.TextStyle.short:
+                max_len = min(max_len, 400)
+            else:
+                max_len = min(max_len, 4000)
+            self.add_item(
+                discord.ui.TextInput(
+                    label=str(field["label"])[:45],
+                    placeholder=str(field.get("placeholder") or "")[:100] or None,
+                    style=style,
+                    required=bool(field.get("required", True)),
+                    max_length=max_len,
+                    custom_id=str(field["id"])[:100],
+                )
+            )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+        if guild is None:
+            await interaction.followup.send("Ошибка: команда только на сервере.", ephemeral=True)
+            return
+
+        parent_id = int(self.cfg["ticket_parent_category_id"])
+        parent = guild.get_channel(parent_id)
+        if not isinstance(parent, discord.CategoryChannel):
+            await interaction.followup.send(
+                "Администратору: в config.json указан неверный `ticket_parent_category_id`.",
+                ephemeral=True,
+            )
+            return
+
+        overwrites: dict[Any, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, manage_channels=True
+            ),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True
+            ),
+        }
+        for rid in self.cfg.get("staff_role_ids", []):
+            role = guild.get_role(int(rid))
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True, send_messages=True, read_message_history=True
+                )
+
+        base = safe_channel_name(f"{self.ticket_type['id']}-{interaction.user.name}")
+        name = f"{base}-{interaction.user.id}"[:100]
+
+        try:
+            channel = await guild.create_text_channel(
+                name=name,
+                category=parent,
+                overwrites=overwrites,
+                topic=f"Тикет: {self.ticket_type['label']} | {interaction.user} ({interaction.user.id})",
+            )
+        except discord.HTTPException as e:
+            log.exception("create_text_channel failed")
+            await interaction.followup.send(f"Не удалось создать канал: {e}", ephemeral=True)
+            return
+
+        lines = [f"**Тип:** {self.ticket_type['label']}", f"**Автор:** {interaction.user.mention} (`{interaction.user.id}`)", ""]
+        for child in self.children:
+            if isinstance(child, discord.ui.TextInput):
+                label = child.label or child.custom_id
+                lines.append(f"**{label}**\n{child.value}")
+
+        embed = discord.Embed(
+            title="Новый тикет",
+            description="\n".join(lines),
+            color=EMBED_COLOR,
+        )
+        embed.set_footer(text="QUICK RUST — поддержка")
+
+        mentions = [interaction.user.mention]
+        for rid in self.cfg.get("staff_role_ids", []):
+            role = guild.get_role(int(rid))
+            if role:
+                mentions.append(role.mention)
+
+        content = " ".join(mentions)
+        await channel.send(content=content, embed=embed)
+
+        await interaction.followup.send(
+            f"Тикет создан: {channel.mention}",
+            ephemeral=True,
+        )
+
+
+class CategorySelect(discord.ui.Select):
+    def __init__(self, cfg: dict[str, Any], options_meta: list[dict[str, Any]]):
+        opts = [
+            discord.SelectOption(
+                label=str(t["label"])[:100],
+                value=str(t["id"])[:100],
+                description=(str(t.get("description") or "")[:100] or None),
+            )
+            for t in options_meta[:25]
+        ]
+        super().__init__(
+            placeholder="Выберите тип тикета",
+            min_values=1,
+            max_values=1,
+            options=opts,
+            custom_id="quickrust:category_select_ephemeral",
+        )
+        self.cfg = cfg
+        self.by_id = {str(t["id"]): t for t in options_meta}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        tid = self.values[0]
+        ticket_type = self.by_id.get(tid)
+        if not ticket_type:
+            await interaction.response.send_message("Неизвестный тип тикета.", ephemeral=True)
+            return
+        fields = ticket_type.get("fields") or []
+        if not fields:
+            await interaction.response.send_message("У этого типа не настроены поля в config.json.", ephemeral=True)
+            return
+        if len(fields) > 5:
+            await interaction.response.send_message(
+                "В config.json у типа больше 5 полей — Discord разрешает максимум 5. Сократите список.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(TicketModal(self.cfg, ticket_type))
+
+
+class CategoryPickView(discord.ui.View):
+    def __init__(self, cfg: dict[str, Any]):
+        super().__init__(timeout=300)
+        self.add_item(CategorySelect(cfg, cfg["ticket_types"]))
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Выберите категорию",
+        style=discord.ButtonStyle.primary,
+        custom_id=PANEL_BUTTON_CUSTOM_ID,
+    )
+    async def open_categories(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        cfg = interaction.client.config  # type: ignore[attr-defined]
+        view = CategoryPickView(cfg)
+        await interaction.response.send_message(
+            "Выберите категорию тикета в меню ниже.",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class TicketBot(commands.Bot):
+    def __init__(self, config: dict[str, Any]):
+        intents = discord.Intents.default()
+        # Только слэш-команды; префикс отключён — не нужен privileged Message Content Intent.
+        super().__init__(command_prefix=None, intents=intents, help_command=None)
+        self.config = config
+
+    async def setup_hook(self) -> None:
+        self.add_view(TicketPanelView())
+        guild_id = int(self.config["guild_id"])
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        log.info("Слэш-команды синхронизированы для гильдии %s", guild_id)
+
+
+def build_panel_embed(cfg: dict[str, Any]) -> discord.Embed:
+    embed = discord.Embed(
+        title="Система поддержки QUICK RUST",
+        color=EMBED_COLOR,
+    )
+    embed.description = (
+        "> Если вам нужна помощь, нажмите на кнопку, соответствующую типу тикета, "
+        "который вы хотите открыть."
+    )
+    url = cfg.get("embed_image_url") or ""
+    if isinstance(url, str) and url.strip():
+        embed.set_image(url=url.strip())
+    return embed
+
+
+def normalize_discord_token(raw: str) -> str:
+    """Убирает типичные ошибки копирования (BOM, кавычки, префикс Bot, лишние строки)."""
+    t = raw.strip().strip("\ufeff")
+    t = t.splitlines()[0].strip()
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'":
+        t = t[1:-1].strip()
+    if t[:4].lower() == "bot ":
+        t = t[4:].strip()
+    return t
+
+
+def load_discord_token_from_dotenv() -> str:
+    """Читает DISCORD_BOT_TOKEN из .env рядом с bot.py (без зависимости python-dotenv)."""
+    path = Path(__file__).with_name(".env")
+    if not path.is_file():
+        return ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "DISCORD_BOT_TOKEN":
+            continue
+        return value.strip().strip('"').strip("'")
+    return ""
+
+
+def read_bot_token() -> str:
+    import os
+
+    raw = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    if not raw:
+        raw = load_discord_token_from_dotenv()
+    if not raw.strip():
+        token_path = Path(__file__).with_name("token.txt")
+        if token_path.is_file():
+            raw = token_path.read_text(encoding="utf-8")
+    t = normalize_discord_token(raw) if raw.strip() else ""
+    if not t:
+        root = Path(__file__).resolve().parent
+        raise SystemExit(
+            "Не найден токен бота. Сделайте одно из трёх:\n"
+            "  1) Файл .env в папке бота со строкой: DISCORD_BOT_TOKEN=ваш_токен\n"
+            f"  2) Файл {root / 'token.txt'} — одна строка, только токен\n"
+            "  3) В PowerShell перед запуском: $env:DISCORD_BOT_TOKEN='ваш_токен'\n"
+            "\nТокен берётся в Discord: Developer Portal → приложение → Bot → Token (не OAuth2 Client Secret)."
+        )
+    if " " in t or "\t" in t:
+        raise SystemExit(
+            "В токене не должно быть пробелов. Скопируйте токен целиком из Developer Portal → Bot → Reset Token / Token."
+        )
+    if len(t) < 50:
+        raise SystemExit(
+            "Токен слишком короткий. Нужен токен приложения (Bot), а не Client Secret и не OAuth URL."
+        )
+    return t
+
+
+def main() -> None:
+    config = load_config()
+    token = read_bot_token()
+
+    bot = TicketBot(config)
+
+    @bot.tree.command(name="ticket_panel", description="Отправить панель тикетов (только для администраторов)")
+    @app_commands.describe(channel="Канал для панели (по умолчанию — текущий)")
+    async def ticket_panel(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:  # type: ignore[union-attr]
+            await interaction.response.send_message("Нужны права администратора.", ephemeral=True)
+            return
+        ch = channel or interaction.channel
+        if not isinstance(ch, discord.TextChannel):
+            await interaction.response.send_message("Укажите текстовый канал.", ephemeral=True)
+            return
+        embed = build_panel_embed(bot.config)
+        await ch.send(embed=embed, view=TicketPanelView())
+        await interaction.response.send_message(f"Панель отправлена в {ch.mention}.", ephemeral=True)
+
+    @bot.event
+    async def on_ready() -> None:
+        log.info("Запущен как %s (%s)", bot.user, bot.user.id if bot.user else "?")
+
+    try:
+        bot.run(token)
+    except discord.LoginFailure:
+        raise SystemExit(
+            "401 / Improper token: токен отклонён Discord.\n"
+            "  • Developer Portal → ваше приложение → Bot → скопируйте Token (или Reset Token).\n"
+            "  • Не используйте Client Secret с вкладки OAuth2.\n"
+            "  • В .env или token.txt — только сам токен, без кавычек и лишних пробелов.\n"
+            "  • Если токен сбрасывали — старый перестаёт работать."
+        ) from None
+
+
+if __name__ == "__main__":
+    main()
