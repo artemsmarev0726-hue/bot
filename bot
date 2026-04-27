@@ -35,6 +35,35 @@ def load_config() -> dict[str, Any]:
         return json.load(f)
 
 
+def validate_ticket_type(ticket_type: dict[str, Any]) -> str | None:
+    """Проверяет корректность описания типа тикета в config.json."""
+    fields = ticket_type.get("fields")
+    if not isinstance(fields, list) or not fields:
+        return f'Тип "{ticket_type.get("id", "?")}" должен содержать непустой список fields.'
+    if len(fields) > 5:
+        return (
+            f'Тип "{ticket_type.get("id", "?")}" содержит {len(fields)} полей, '
+            "Discord разрешает максимум 5 полей в модальном окне."
+        )
+    seen_ids: set[str] = set()
+    for idx, field in enumerate(fields, start=1):
+        if not isinstance(field, dict):
+            return f'Тип "{ticket_type.get("id", "?")}": поле #{idx} должно быть объектом.'
+        fid = str(field.get("id") or "").strip()
+        if not fid:
+            return f'Тип "{ticket_type.get("id", "?")}": у поля #{idx} отсутствует id.'
+        if fid in seen_ids:
+            return f'Тип "{ticket_type.get("id", "?")}": дублирующийся id поля "{fid}".'
+        seen_ids.add(fid)
+        style = str(field.get("style") or "short")
+        if style not in {"short", "paragraph"}:
+            return (
+                f'Тип "{ticket_type.get("id", "?")}": поле "{fid}" имеет style="{style}". '
+                'Допустимо только "short" или "paragraph".'
+            )
+    return None
+
+
 def safe_channel_name(s: str, max_len: int = 90) -> str:
     s = s.lower().replace(" ", "-")
     s = re.sub(r"[^a-z0-9\-_]", "", s, flags=re.IGNORECASE)
@@ -53,6 +82,18 @@ def parse_option_emoji(raw: Any) -> str | discord.PartialEmoji | None:
         except Exception:
             return None
     return s
+
+
+def resolve_select_emoji(
+    raw: Any, guild: discord.Guild | None
+) -> str | discord.PartialEmoji | None:
+    """Возвращает эмодзи для SelectOption, мягко пропуская недоступные кастомные эмодзи."""
+    parsed = parse_option_emoji(raw)
+    if isinstance(parsed, discord.PartialEmoji) and parsed.id:
+        if guild is None or guild.get_emoji(parsed.id) is None:
+            log.warning("Эмодзи %s недоступен боту в этой гильдии, пункт будет без эмодзи.", parsed)
+            return None
+    return parsed
 
 
 class TicketModal(discord.ui.Modal):
@@ -161,18 +202,23 @@ class TicketModal(discord.ui.Modal):
 
 
 class CategorySelect(discord.ui.Select):
-    def __init__(self, cfg: dict[str, Any], options_meta: list[dict[str, Any]]):
+    def __init__(
+        self,
+        cfg: dict[str, Any],
+        options_meta: list[dict[str, Any]],
+        guild: discord.Guild | None = None,
+    ):
         opts = [
             discord.SelectOption(
                 label=str(t["label"])[:100],
                 value=str(t["id"])[:100],
                 description=(str(t.get("description") or "")[:100] or None),
-                emoji=parse_option_emoji(t.get("emoji")),
+                emoji=resolve_select_emoji(t.get("emoji"), guild),
             )
             for t in options_meta[:25]
         ]
         super().__init__(
-            placeholder="Выберите категорию",
+            placeholder="Выберите тип тикета",
             min_values=1,
             max_values=1,
             options=opts,
@@ -187,25 +233,29 @@ class CategorySelect(discord.ui.Select):
         if not ticket_type:
             await interaction.response.send_message("Неизвестный тип тикета.", ephemeral=True)
             return
-        fields = ticket_type.get("fields") or []
-        if not fields:
-            await interaction.response.send_message("У этого типа не настроены поля в config.json.", ephemeral=True)
-            return
-        if len(fields) > 5:
+        err = validate_ticket_type(ticket_type)
+        if err:
             await interaction.response.send_message(
-                "В config.json у типа больше 5 полей — Discord разрешает максимум 5. Сократите список.",
+                f"Ошибка конфигурации: {err}",
                 ephemeral=True,
             )
             return
-        await interaction.response.send_modal(TicketModal(self.cfg, ticket_type))
+        try:
+            await interaction.response.send_modal(TicketModal(self.cfg, ticket_type))
+        except (ValueError, discord.HTTPException) as e:
+            log.exception("send_modal failed")
+            await interaction.response.send_message(
+                f"Не удалось открыть форму тикета. Проверьте поля в config.json. Детали: {e}",
+                ephemeral=True,
+            )
 
 
 class TicketPanelView(discord.ui.View):
     """Панель: эмбед + выпадающий список типов тикетов (сразу под сообщением)."""
 
-    def __init__(self, cfg: dict[str, Any]):
+    def __init__(self, cfg: dict[str, Any], guild: discord.Guild | None = None):
         super().__init__(timeout=None)
-        self.add_item(CategorySelect(cfg, cfg["ticket_types"]))
+        self.add_item(CategorySelect(cfg, cfg["ticket_types"], guild))
 
 
 class TicketCloseConfirmView(discord.ui.View):
@@ -311,7 +361,7 @@ def build_panel_embed(cfg: dict[str, Any]) -> discord.Embed:
         color=EMBED_COLOR,
     )
     embed.description = (
-        "> Если вам нужна помощь, хотите встать на должность и тд. Выберите категорию тикета и заполните форму!"
+        "> Если вам нужна помощь, выберите тип тикета в списке ниже и заполните форму."
     )
     url = cfg.get("embed_image_url") or ""
     if isinstance(url, str) and url.strip():
@@ -383,6 +433,15 @@ def read_bot_token() -> str:
 
 def main() -> None:
     config = load_config()
+    ticket_types = config.get("ticket_types")
+    if not isinstance(ticket_types, list) or not ticket_types:
+        raise SystemExit('В config.json должен быть непустой список "ticket_types".')
+    for t in ticket_types:
+        if not isinstance(t, dict):
+            raise SystemExit('Каждый элемент "ticket_types" должен быть объектом.')
+        e = validate_ticket_type(t)
+        if e:
+            raise SystemExit(f"Ошибка в config.json: {e}")
     token = read_bot_token()
 
     bot = TicketBot(config)
@@ -404,7 +463,7 @@ def main() -> None:
             await interaction.response.send_message("Укажите текстовый канал.", ephemeral=True)
             return
         embed = build_panel_embed(bot.config)
-        await ch.send(embed=embed, view=TicketPanelView(bot.config))
+        await ch.send(embed=embed, view=TicketPanelView(bot.config, interaction.guild))
         await interaction.response.send_message(f"Панель отправлена в {ch.mention}.", ephemeral=True)
 
     @bot.event
