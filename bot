@@ -341,6 +341,7 @@ class TicketCloseView(discord.ui.View):
 class TicketBot(commands.Bot):
     def __init__(self, config: dict[str, Any]):
         intents = discord.Intents.default()
+        intents.members = True
         # Только слэш-команды; префикс отключён — не нужен privileged Message Content Intent.
         super().__init__(command_prefix=None, intents=intents, help_command=None)
         self.config = config
@@ -465,6 +466,81 @@ def main() -> None:
         embed = build_panel_embed(bot.config)
         await ch.send(embed=embed, view=TicketPanelView(bot.config, interaction.guild))
         await interaction.response.send_message(f"Панель отправлена в {ch.mention}.", ephemeral=True)
+
+    @bot.tree.command(name="alert", description="Отправить сообщение в указанный канал (только для администраторов)")
+    @app_commands.describe(channel="Канал назначения", message="Текст сообщения")
+    async def alert(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        message: str,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:  # type: ignore[union-attr]
+            await interaction.response.send_message("Нужны права администратора.", ephemeral=True)
+            return
+        text = message.strip()
+        if not text:
+            await interaction.response.send_message("Сообщение не может быть пустым.", ephemeral=True)
+            return
+        if len(text) > 2000:
+            await interaction.response.send_message("Сообщение слишком длинное (максимум 2000 символов).", ephemeral=True)
+            return
+        await channel.send(text)
+        await interaction.response.send_message(f"Отправлено в {channel.mention}.", ephemeral=True)
+
+    @bot.tree.command(name="all", description="Отправить ЛС всем участникам сервера (только для администраторов)")
+    @app_commands.describe(message="Текст сообщения для рассылки")
+    async def all_members_dm(interaction: discord.Interaction, message: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Только на сервере.", ephemeral=True)
+            return
+        if not interaction.user.guild_permissions.administrator:  # type: ignore[union-attr]
+            await interaction.response.send_message("Нужны права администратора.", ephemeral=True)
+            return
+        text = message.strip()
+        if not text:
+            await interaction.response.send_message("Сообщение не может быть пустым.", ephemeral=True)
+            return
+        if len(text) > 2000:
+            await interaction.response.send_message("Сообщение слишком длинное (максимум 2000 символов).", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            await guild.chunk(cache=True)
+        except discord.HTTPException:
+            pass
+
+        sent = 0
+        failed = 0
+        skipped_bots = 0
+        skipped_requester = 0
+
+        for member in guild.members:
+            if member.bot:
+                skipped_bots += 1
+                continue
+            if member.id == interaction.user.id:
+                skipped_requester += 1
+                continue
+            try:
+                await member.send(text)
+                sent += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+
+        await interaction.followup.send(
+            "Рассылка завершена.\n"
+            f"Отправлено: {sent}\n"
+            f"Не удалось: {failed}\n"
+            f"Пропущено ботов: {skipped_bots}\n"
+            f"Пропущен инициатор: {skipped_requester}",
+            ephemeral=True,
+        )
 
     @bot.event
     async def on_ready() -> None:
